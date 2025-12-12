@@ -1,20 +1,10 @@
-# FastAPI and ASGI server
-fastapi>=0.124.0
-uvicorn[standard]>=0.38.0
-
-# OpenAI and Agents
-openai>=1.59.0
-openai-agents>=0.6.2
-
-# Vector Database
-qdrant-client>=1.16.1
-
-# Data validation and environment
-pydantic>=2.10.0
-python-dotenv>=1.2.1
-
-# HTTP utilities
-httpx>=0.28.0
-
-# Additional support
-python-multipart>=0.0.20
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.5.3
+python-dotenv>=1.0.0
+qdrant-client>=1.7.0
+openai>=2.11.0
+trafilatura>=1.6.4
+requests>=2.31.0
+aiofiles>=24.1.0
+openai-agents>=0.6.3

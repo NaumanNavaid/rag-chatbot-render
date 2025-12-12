@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv run test_api.py:*)",
+      "Bash(curl:*)",
+      "Bash(uv run:*)",
+      "Bash(python:*)",
+      "Bash(taskkill:*)",
+      "Bash(dir:*)",
+      "Bash(powershell:*)"
+    ]
+  }
+}
