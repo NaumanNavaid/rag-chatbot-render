@@ -1,10 +1,28 @@
+# FastAPI and ASGI server
 fastapi>=0.109.0
 uvicorn[standard]>=0.27.0
+
+# Database
+asyncpg>=0.31.0
+psycopg2-binary>=2.9.11
+
+# Authentication
+bcrypt>=5.0.0
+python-jose[cryptography]>=3.5.0
+
+# Data validation and email
 pydantic>=2.5.3
-python-dotenv>=1.0.0
-qdrant-client>=1.7.0
+email-validator>=2.3.0
+
+# AI and OpenAI
 openai>=2.11.0
-trafilatura>=1.6.4
-requests>=2.31.0
-aiofiles>=24.1.0
 openai-agents>=0.6.3
+
+# Vector Database
+qdrant-client>=1.7.0
+
+# Environment and utilities
+python-dotenv>=1.0.0
+aiofiles>=24.1.0
+requests>=2.31.0
+trafilatura>=1.6.4
