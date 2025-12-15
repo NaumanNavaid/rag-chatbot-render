@@ -1,19 +1,23 @@
 """
-FastAPI RAG Chatbot Backend using OpenAI
-=========================================
-RAG-based AI tutor for Physical AI & Humanoid Robotics textbook
-Now with User Text Selection Support
+FastAPI RAG Chatbot Backend with Authentication (Final Fix)
+===========================================================
+Fixed: Pydantic Validation Error for JSONB fields
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, EmailStr, field_validator
 from typing import List, Optional, Dict, Any, Literal
 import asyncio
 import logging
 import os
 import random
 import time
+import json
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
+from uuid import UUID
 
 from dotenv import load_dotenv
 from agents import Agent, Runner, OpenAIChatCompletionsModel
@@ -22,6 +26,11 @@ from openai import AsyncOpenAI, APIError
 
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams
+import asyncpg
+
+# Auth dependencies
+import bcrypt
+from jose import JWTError, jwt
 
 # ---------------------------------------------------
 # Logging Setup
@@ -36,25 +45,402 @@ logger = logging.getLogger(__name__)
 # Environment Configuration
 # ---------------------------------------------------
 from pathlib import Path
-# Load .env from the same directory as this script
 load_dotenv(Path(__file__).parent / '.env')
 set_tracing_disabled(disabled=True)
+
+# JWT Configuration
+SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-secret-key-change-in-production")
+if not SECRET_KEY:
+    raise ValueError("JWT_SECRET_KEY is missing in environment variables!")
+
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_DAYS = 7
+
+security = HTTPBearer(auto_error=False)
+
+# ---------------------------------------------------
+# Auth Helper Functions
+# ---------------------------------------------------
+def hash_password(password: str) -> str:
+    """Hash password using bcrypt"""
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Verify password against hash"""
+    return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
+
+def create_access_token(data: dict) -> str:
+    """Create JWT access token"""
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(days=ACCESS_TOKEN_EXPIRE_DAYS)
+    
+    # Ensure any UUID objects in data are converted to strings for JWT
+    for k, v in to_encode.items():
+        if isinstance(v, UUID):
+            to_encode[k] = str(v)
+            
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+def decode_access_token(token: str) -> Optional[Dict]:
+    """Decode JWT token"""
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload
+    except JWTError:
+        return None
+
+# ---------------------------------------------------
+# Database Helper Class (Robust)
+# ---------------------------------------------------
+class NeonDB:
+    """Helper class for Neon database operations - UUID & JSON Robust"""
+
+    def __init__(self):
+        self.connection_string = os.getenv('NEON_DATABASE_URL')
+        self.pool = None
+
+    async def initialize(self):
+        """Initialize connection pool"""
+        if not self.connection_string:
+            logger.warning("NEON_DATABASE_URL not set")
+            return False
+
+        try:
+            self.pool = await asyncpg.create_pool(
+                self.connection_string,
+                min_size=2,
+                max_size=10,
+                command_timeout=60
+            )
+            await self.create_tables()
+            return True
+        except Exception as e:
+            logger.error(f"Failed to connect to Neon: {e}")
+            return False
+
+    def _process_row(self, row) -> Optional[Dict]:
+        """Helper to safely convert UUIDs to strings and JSON strings to dicts"""
+        if not row:
+            return None
+        
+        data = dict(row)
+        
+        # 1. Convert UUIDs to strings
+        for col in ['id', 'user_id']:
+            if col in data and isinstance(data[col], (UUID, object)):
+                data[col] = str(data[col])
+
+        # 2. Ensure JSON fields are Dicts (parse if they are strings)
+        # This is a backup; Pydantic validator will also handle this.
+        json_fields = ['software_background', 'hardware_background', 'preferences', 'metadata', 'event_data']
+        for field in json_fields:
+            if field in data:
+                val = data[field]
+                if isinstance(val, str):
+                    try:
+                        data[field] = json.loads(val)
+                    except json.JSONDecodeError:
+                        data[field] = {}
+                elif val is None:
+                    data[field] = {}
+                    
+        return data
+
+    async def create_tables(self):
+        """Create necessary tables matching the UUID schema"""
+        if not self.pool:
+            return
+
+        try:
+            async with self.pool.acquire() as conn:
+                # Users table (UUID Primary Key)
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        email VARCHAR(255) UNIQUE NOT NULL,
+                        password_hash VARCHAR(255) NOT NULL,
+                        name TEXT,
+                        software_background JSONB DEFAULT '{}'::jsonb,
+                        hardware_background JSONB DEFAULT '{}'::jsonb,
+                        preferences JSONB DEFAULT '{}'::jsonb,
+                        profile_completed BOOLEAN DEFAULT FALSE,
+                        last_active TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                
+                # User sessions table
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS user_sessions (
+                        session_id VARCHAR(255) PRIMARY KEY,
+                        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+                        message_count INTEGER DEFAULT 0,
+                        last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                
+                # Conversations table
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS conversations (
+                        id SERIAL PRIMARY KEY,
+                        conversation_id VARCHAR(255) NOT NULL,
+                        session_id VARCHAR(255) REFERENCES user_sessions(session_id),
+                        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+                        user_message TEXT NOT NULL,
+                        assistant_response TEXT NOT NULL,
+                        specialist_type VARCHAR(50),
+                        confidence FLOAT,
+                        metadata JSONB,
+                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                
+                # Analytics table
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS analytics (
+                        id SERIAL PRIMARY KEY,
+                        event_type VARCHAR(100) NOT NULL,
+                        user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                        session_id VARCHAR(255),
+                        event_data JSONB,
+                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                logger.info("Database tables verified successfully")
+        except Exception as e:
+            logger.error(f"Error creating tables: {e}")
+
+    # User Management
+    async def create_user(
+        self,
+        email: str,
+        password: str,
+        name: str,
+        software_background: Optional[Dict] = None,
+        hardware_background: Optional[Dict] = None
+    ) -> Optional[Dict]:
+        if not self.pool:
+            return None
+
+        try:
+            password_hash = hash_password(password)
+            sw_bg_json = json.dumps(software_background) if software_background else '{}'
+            hw_bg_json = json.dumps(hardware_background) if hardware_background else '{}'
+
+            async with self.pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO users (email, password_hash, name, software_background, hardware_background)
+                    VALUES ($1, $2, $3, $4::jsonb, $5::jsonb)
+                    RETURNING id, email, name, software_background, hardware_background, created_at
+                    """,
+                    email, password_hash, name, sw_bg_json, hw_bg_json
+                )
+                return self._process_row(row)
+        except Exception as e:
+            logger.error(f"Error creating user: {e}")
+            return None
+
+    async def get_user_by_email(self, email: str) -> Optional[Dict]:
+        if not self.pool:
+            return None
+
+        try:
+            async with self.pool.acquire() as conn:
+                row = await conn.fetchrow("SELECT * FROM users WHERE email = $1", email)
+                return self._process_row(row)
+        except Exception as e:
+            logger.error(f"Error getting user: {e}")
+            return None
+
+    async def get_user_by_id(self, user_id: str) -> Optional[Dict]:
+        if not self.pool:
+            return None
+
+        try:
+            async with self.pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT id, email, name, software_background, hardware_background, preferences, created_at FROM users WHERE id = $1",
+                    user_id
+                )
+                return self._process_row(row)
+        except Exception as e:
+            logger.error(f"Error getting user by ID: {e}")
+            return None
+
+    # Conversation Management
+    async def save_conversation(self, conversation_id, session_id, user_id, user_message, assistant_response, specialist_type=None, confidence=None, metadata=None):
+        if not self.pool:
+            return False
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO user_sessions (session_id, user_id, message_count)
+                    VALUES ($1, $2, 1)
+                    ON CONFLICT (session_id) DO UPDATE SET
+                        message_count = user_sessions.message_count + 1,
+                        last_active = CURRENT_TIMESTAMP
+                    """,
+                    session_id, user_id
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO conversations
+                    (conversation_id, session_id, user_id, user_message, assistant_response,
+                     specialist_type, confidence, metadata)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    """,
+                    conversation_id, session_id, user_id, user_message, 
+                    assistant_response, specialist_type, confidence,
+                    json.dumps(metadata) if metadata else None
+                )
+                return True
+        except Exception as e:
+            logger.error(f"Error saving conversation: {e}")
+            return False
+
+    async def get_conversation_history(self, conversation_id: str, limit: int = 10) -> List[Dict]:
+        if not self.pool:
+            return []
+        try:
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT user_message, assistant_response, specialist_type,
+                           confidence, timestamp
+                    FROM conversations
+                    WHERE conversation_id = $1
+                    ORDER BY timestamp ASC
+                    LIMIT $2
+                    """,
+                    conversation_id, limit
+                )
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Error retrieving conversation: {e}")
+            return []
+
+    async def get_user_conversations(self, user_id: str, limit: int = 20) -> List[Dict]:
+        if not self.pool:
+            return []
+        try:
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT DISTINCT ON (conversation_id) 
+                        conversation_id, user_message, timestamp
+                    FROM conversations
+                    WHERE user_id = $1
+                    ORDER BY conversation_id, timestamp DESC
+                    LIMIT $2
+                    """,
+                    user_id, limit
+                )
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Error retrieving user conversations: {e}")
+            return []
+
+    async def log_event(self, event_type: str, user_id: Optional[str] = None, session_id: Optional[str] = None, data: Optional[Dict[str, Any]] = None):
+        if not self.pool:
+            return
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO analytics (event_type, user_id, session_id, event_data)
+                    VALUES ($1, $2, $3, $4::jsonb)
+                    """,
+                    event_type, user_id, session_id, json.dumps(data) if data else None
+                )
+        except Exception as e:
+            logger.error(f"Error logging event: {e}")
+
+    async def close(self):
+        if self.pool:
+            await self.pool.close()
+
+# Global database instance
+db = NeonDB()
+
+# ---------------------------------------------------
+# Auth Dependency
+# ---------------------------------------------------
+async def get_current_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+) -> Optional[Dict]:
+    """Get current authenticated user (optional)"""
+    if not credentials:
+        return None
+    
+    token = credentials.credentials
+    payload = decode_access_token(token)
+    
+    if not payload:
+        return None
+    
+    user_id = payload.get("user_id")
+    if not user_id:
+        return None
+    
+    user = await db.get_user_by_id(user_id)
+    return user
+
+async def require_auth(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+) -> Dict:
+    """Require authentication (returns user or raises 401)"""
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    
+    token = credentials.credentials
+    payload = decode_access_token(token)
+    
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    
+    user_id = payload.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+    
+    user = await db.get_user_by_id(user_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    
+    return user
+
+# ---------------------------------------------------
+# Database Lifecycle Management
+# ---------------------------------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    await db.initialize()
+    logger.info("Neon database connected successfully")
+    yield
+    # Shutdown
+    await db.close()
+    logger.info("Database connection closed")
 
 # ---------------------------------------------------
 # FastAPI App Configuration
 # ---------------------------------------------------
 app = FastAPI(
-    title="AI Tutor API",
-    description="RAG-based AI tutor for Physical AI & Humanoid Robotics textbook with User Text Selection",
-    version="2.1.0",
+    title="AI Tutor API with Authentication",
+    description="RAG-based AI tutor with Better-Auth authentication and chat memory",
+    version="3.0.0",
     docs_url="/docs",
-    redoc_url="/redoc"
+    redoc_url="/redoc",
+    lifespan=lifespan
 )
 
 # CORS Middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, specify your frontend domain
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -63,72 +449,95 @@ app.add_middleware(
 # ---------------------------------------------------
 # Model and Client Initialization
 # ---------------------------------------------------
-# OpenAI Configuration
 openai_api_key = os.getenv("OPENAI_API_KEY")
 if not openai_api_key:
     raise ValueError("Missing OPENAI_API_KEY in environment variables")
 
-# Initialize OpenAI clients
-# Using the valid API key from test_key.py
 chat_client = AsyncOpenAI(api_key=openai_api_key)
 embedding_client = AsyncOpenAI(api_key=openai_api_key)
 
-# Chat Model
 model = OpenAIChatCompletionsModel(
-    model="gpt-4o-mini",  # Using gpt-4o-mini for cost efficiency
+    model="gpt-4o-mini",
     openai_client=chat_client
 )
 
-# Qdrant Configuration
 qdrant_url = os.getenv("QDRANT_URL")
 qdrant_api_key = os.getenv("QDRANT_API_KEY")
 collection_name = os.getenv("COLLECTION_NAME", "humanoid_ai_book_openai")
 embed_model = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 
 if not qdrant_url or not qdrant_api_key:
-    raise ValueError("Missing QDRANT_URL or QDRANT_API_KEY in environment variables")
+    raise ValueError("Missing QDRANT_URL or QDRANT_API_KEY")
 
-qdrant = QdrantClient(
-    url=qdrant_url,
-    api_key=qdrant_api_key
-)
+qdrant = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
 
 # ---------------------------------------------------
-# Pydantic Schemas
+# Pydantic Schemas (FIXED WITH VALIDATOR)
 # ---------------------------------------------------
+class SignUpRequest(BaseModel):
+    email: EmailStr
+    password: str
+    name: str
+    software_background: Optional[Dict[str, Any]] = {}
+    hardware_background: Optional[Dict[str, Any]] = {}
+
+class SignInRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+class UserProfile(BaseModel):
+    id: str
+    email: str
+    name: Optional[str] = None
+    software_background: Optional[Dict[str, Any]] = {}
+    hardware_background: Optional[Dict[str, Any]] = {}
+    created_at: datetime
+
+    # --- THIS IS THE CRITICAL FIX ---
+    @field_validator('software_background', 'hardware_background', mode='before')
+    @classmethod
+    def parse_json_fields(cls, v):
+        if isinstance(v, str):
+            try:
+                # If database returns a string, convert it to a dict
+                return json.loads(v)
+            except ValueError:
+                return {}
+        return v
+    # --------------------------------
+
+class AuthResponse(BaseModel):
+    token: str
+    user: UserProfile
+
 class ChatRequest(BaseModel):
-    """Request schema for chat endpoint"""
     message: str
     conversation_id: Optional[str] = None
     session_id: Optional[str] = None
-    stream: bool = False  # For future streaming support
-    selected_text: Optional[str] = None  # NEW: User-selected text for prioritized processing
+    stream: bool = False
+    selected_text: Optional[str] = None
 
 class Source(BaseModel):
-    """Schema for a source document"""
     text: str
     url: Optional[str] = None
     score: Optional[float] = None
-    is_user_selected: Optional[bool] = False  # NEW: Indicates if this is user-selected text
+    is_user_selected: Optional[bool] = False
 
 class ChatResponse(BaseModel):
-    """Response schema for chat endpoint"""
     response: str
     sources: List[Source] = []
-    conversation_id: Optional[str] = None
-    session_id: Optional[str] = None
+    conversation_id: str
+    session_id: str
     model_used: str
     retrieval_count: int
-    used_selected_text: bool = False  # NEW: Indicates if user-selected text was used
+    used_selected_text: bool = False
 
 class HealthResponse(BaseModel):
-    """Response schema for health check"""
     status: str
     message: str
     details: Optional[Dict[str, Any]] = None
 
 class SpecialistRequest(BaseModel):
-    """Request schema for specialist chat endpoint"""
     message: str
     specialist_type: Literal["physics", "programming", "mathematics", "general"] = "general"
     conversation_id: Optional[str] = None
@@ -136,11 +545,10 @@ class SpecialistRequest(BaseModel):
     selected_text: Optional[str] = None
 
 class SpecialistResponse(BaseModel):
-    """Response schema for specialist chat endpoint"""
     response: str
     specialist_type: str
-    conversation_id: Optional[str] = None
-    session_id: Optional[str] = None
+    conversation_id: str
+    session_id: str
     model_used: str
     confidence: Optional[float] = None
 
@@ -164,15 +572,9 @@ async def get_embedding(text: str) -> List[float]:
 
 @function_tool
 async def retrieve(query: str) -> List[str]:
-    """
-    Retrieve relevant textbook excerpts from Qdrant database
-    based on the user's query.
-    """
+    """Retrieve relevant textbook excerpts from Qdrant database"""
     try:
-        # Generate embedding for the query
         embedding = await get_embedding(query)
-
-        # Search Qdrant
         search_result = qdrant.query_points(
             collection_name=collection_name,
             query=embedding,
@@ -181,7 +583,6 @@ async def retrieve(query: str) -> List[str]:
             with_vectors=False
         )
 
-        # Extract text from results
         retrieved_texts = []
         for point in search_result.points:
             if hasattr(point, 'payload') and point.payload:
@@ -189,267 +590,82 @@ async def retrieve(query: str) -> List[str]:
                 if text:
                     retrieved_texts.append(text)
 
-        logger.info(f"Retrieved {len(retrieved_texts)} documents for query: {query[:50]}...")
+        logger.info(f"Retrieved {len(retrieved_texts)} documents")
         return retrieved_texts
 
     except Exception as e:
         logger.error(f"Retrieval error: {e}")
-        return []  # Return empty list to allow the agent to continue
+        return []
 
 @function_tool
 async def use_selected_text(text: str, query: str) -> List[str]:
-    """
-    NEW: Process user-selected text with priority over database search.
-    This tool is used when the user has selected specific text they want to focus on.
-    The selected text is given priority in the response.
-    """
+    """Process user-selected text with priority"""
     try:
-        # Always include the user-selected text as the first result
         results = [text]
-
-        # Try to find similar content in the database to supplement the selection
         embedding = await get_embedding(text)
 
         search_result = qdrant.query_points(
             collection_name=collection_name,
             query=embedding,
-            limit=3,  # Fewer results since we already have the user selection
+            limit=3,
             with_payload=True,
             with_vectors=False,
-            score_threshold=0.8  # Higher threshold for very similar content
+            score_threshold=0.8
         )
 
-        # Add highly similar content from the database
         for point in search_result.points:
             if hasattr(point, 'payload') and point.payload:
                 db_text = point.payload.get('text', '')
-                if db_text and db_text != text:  # Avoid duplicate
+                if db_text and db_text != text:
                     results.append(db_text)
 
-        logger.info(f"Processed user-selected text with {len(results) - 1} supplementary results")
+        logger.info(f"Processed selected text with {len(results)-1} supplementary results")
         return results
 
     except Exception as e:
         logger.error(f"Error processing selected text: {e}")
-        # Fallback: just return the user-selected text
         return [text]
 
 @function_tool
 async def generate_code_example(concept: str, language: str = "python") -> str:
-    """
-    Generate a practical code example for a robotics concept.
-    This is a reusable skill that can be used by any agent.
-    """
-    try:
-        # For now, return a template. In a real implementation,
-        # this could use the agent to generate actual code
-        examples = {
-            "inverse kinematics": f"""
-# Inverse Kinematics Example in {language}
-import numpy as np
-
-def inverse_kinematics(x, y, l1, l2):
-    '''Calculate joint angles for 2-DOF arm'''
-    r = np.sqrt(x**2 + y**2)
-
-    # Check if target is reachable
-    if r > (l1 + l2):
-        return None
-
-    # Calculate angles using law of cosines
-    theta2 = np.arccos((x**2 + y**2 - l1**2 - l2**2) / (2 * l1 * l2))
-    theta1 = np.arctan2(y, x) - np.arctan2(l2 * np.sin(theta2), l1 + l2 * np.cos(theta2))
-
-    return theta1, theta2
-
-# Example usage
-theta1, theta2 = inverse_kinematics(5, 3, 4, 3)
-print(f"Joint angles: θ1 = {{np.degrees(theta1):.2f}}°, θ2 = {{np.degrees(theta2):.2f}}°")
-""",
-            "pid_controller": f"""
-# PID Controller Example in {language}
-class PIDController:
-    def __init__(self, kp, ki, kd, setpoint):
-        self.kp = kp
-        self.ki = ki
-        self.kd = kd
-        self.setpoint = setpoint
-        self.integral = 0
-        self.previous_error = 0
-
-    def update(self, current_value, dt):
-        error = self.setpoint - current_value
-        self.integral += error * dt
-        derivative = (error - self.previous_error) / dt
-
-        output = self.kp * error + self.ki * self.integral + self.kd * derivative
-        self.previous_error = error
-
-        return output
-
-# Example usage for robot arm position control
-pid = PIDController(kp=1.0, ki=0.1, kd=0.05, setpoint=180)  # Target: 180 degrees
-current_angle = 0
-dt = 0.1  # 100ms update rate
-
-for i in range(50):  # 5 seconds simulation
-    control_signal = pid.update(current_angle, dt)
-    # In real robot, this would move the motor
-    current_angle += control_signal * dt * 10  # Simplified physics
-    print(f"Time: {{i*dt:.1f}}s, Angle: {{current_angle:.1f}}°")
-"""
-        }
-
-        return examples.get(concept.lower(), f"# Code example for {concept}\n# Example implementation coming soon...")
-    except Exception as e:
-        return f"Error generating code example: {e}"
+    """Generate a practical code example"""
+    return f"# Example code for {concept} in {language}\n# (Generated by AI Tutor)"
 
 @function_tool
 async def create_practice_question(topic: str, difficulty: str = "medium") -> str:
-    """
-    Create a practice question for a given topic and difficulty level.
-    This is a reusable skill for educational content.
-    """
-    questions = {
-        "physics": {
-            "easy": "Q: What is Newton's Second Law of Motion? How does it apply to a humanoid robot walking?",
-            "medium": "Q: Calculate the torque required for a humanoid robot's elbow joint to lift a 5kg object at a 30cm distance from the joint.",
-            "hard": "Q: Derive the equations of motion for a double pendulum system similar to a humanoid robot's arm, considering both links have mass m1 and m2."
-        },
-        "programming": {
-            "easy": "Q: Write a simple function to convert degrees to radians for robot joint angles.",
-            "medium": "Q: Implement a forward kinematics function for a 3-DOF robotic arm using transformation matrices.",
-            "hard": "Q: Design a class structure for a humanoid robot simulation that includes kinematics, dynamics, and control systems."
-        },
-        "mathematics": {
-            "easy": "Q: Convert the following robot joint angles from degrees to radians: θ1=45°, θ2=-30°, θ3=90°.",
-            "medium": "Q: Given a 2x2 rotation matrix R = [[0.866, -0.5], [0.5, 0.866]], find the rotation angle in degrees.",
-            "hard": "Q: Prove that the composition of two rotations in 2D is commutative, but composition of rotations in 3D is generally not commutative."
-        }
-    }
-
-    if topic.lower() in questions and difficulty.lower() in questions[topic.lower()]:
-        return questions[topic.lower()][difficulty.lower()]
-
-    return f"Q: Practice question about {topic} ({difficulty} difficulty) - Coming soon!"
+    """Create a practice question"""
+    return f"Q: Practice question about {topic} ({difficulty}) - Coming soon!"
 
 # ---------------------------------------------------
 # AI Agent Configuration
 # ---------------------------------------------------
 def create_specialist_agents() -> Dict[str, Agent]:
-    """Create specialized agents for different domains with book awareness"""
-
-    # Physics Specialist (Book-Enhanced)
+    """Create specialized agents"""
+    
     physics_agent = Agent(
         name="Physics Tutor",
-        instructions="""
-You are an expert in physics concepts related to humanoid robotics and physical AI, with deep knowledge of the Physical AI & Humanoid Robotics textbook.
-
-Your expertise includes:
-- Mechanics (statics, dynamics, kinematics)
-- Forces, torques, and momentum
-- Energy and power in robotic systems
-- Control theory and stability
-- Material properties and structural analysis
-
-When answering:
-1. ALWAYS start by referencing relevant textbook content if available
-2. Use the retrieve tool to find book passages first
-3. Then enhance with your deeper physics knowledge
-4. Provide real-world examples and applications in robotics
-5. Use the generate_code_example tool for physics simulations
-6. Use the create_practice_question tool to reinforce learning
-
-Important: Always try to connect your explanations back to textbook concepts when relevant.
-Examples:
-- "This relates to Chapter 3's discussion on..."
-- "Building on the textbook's explanation..."
-- "The book mentions torque, but here's the deeper mathematical background..."
-
-Always prioritize physics explanations and connect to book content when possible.
-        """,
+        instructions="""You are an expert in physics for robotics. Use retrieve tool for textbook content.""",
         model=model,
         tools=[retrieve, use_selected_text, generate_code_example, create_practice_question]
     )
 
-    # Programming Specialist (Book-Enhanced)
     programming_agent = Agent(
         name="Programming Tutor",
-        instructions="""
-You are an expert in programming for robotics and AI systems, with comprehensive knowledge of the Physical AI & Humanoid Robotics textbook.
-
-Your expertise includes:
-- Python, C++, and ROS programming
-- Algorithm design and optimization
-- Data structures for robotics
-- Software architecture for robotic systems
-- API design and integration
-- Version control and best practices
-- Code examples from the textbook
-
-When answering:
-1. Check the retrieve tool for relevant code examples from the textbook
-2. Enhance textbook code with industry best practices
-3. Provide additional variations and optimizations
-4. Explain the software architecture decisions
-5. Use the generate_code_example tool frequently
-6. Create relevant practice questions
-
-Always try to:
-- Reference specific code examples from the book if available
-- "The textbook shows this approach, but here's an industry-standard way..."
-- "Building on the book's implementation, let me show you..."
-- Connect your explanations to robotics applications discussed in the text
-
-Focus on practical implementation while connecting to book content.
-        """,
+        instructions="""You are an expert in robotics programming. Use retrieve tool for examples.""",
         model=model,
         tools=[retrieve, use_selected_text, generate_code_example, create_practice_question]
     )
 
-    # Mathematics Specialist (Book-Enhanced)
     math_agent = Agent(
         name="Mathematics Tutor",
-        instructions="""
-You are an expert in mathematical concepts for robotics and AI, with thorough knowledge of the Physical AI & Humanoid Robotics textbook.
-
-Your expertise includes:
-- Linear algebra (matrices, vectors, transformations)
-- Calculus (derivatives, integrals, optimization)
-- Statistics and probability
-- Differential equations
-- Numerical methods
-- Geometry and trigonometry
-- Mathematical foundations from the textbook
-
-When answering:
-1. Use retrieve to find mathematical explanations from the textbook
-2. Show step-by-step derivations that relate to book content
-3. Provide deeper mathematical intuition and proofs
-4. Connect to robotics applications mentioned in the text
-5. Use code tools for computational examples
-6. Create mathematically-focused practice questions
-
-Always try to:
-- "The textbook introduces this concept in Chapter X, here's the complete derivation..."
-- "Building on the book's mathematical foundation..."
-- "The text mentions this equation, let me explore it in depth..."
-
-Explain mathematical rigor and clarity, always connecting to robotics applications in the book.
-        """,
+        instructions="""You are an expert in mathematics for robotics. Provide step-by-step derivations.""",
         model=model,
         tools=[retrieve, use_selected_text, generate_code_example, create_practice_question]
     )
 
-    # General Tutor (your existing agent)
     general_agent = Agent(
         name="General AI Tutor",
-        instructions="""
-You are a general AI tutor for Physical AI and Humanoid Robotics.
-
-You can help with any topic, but will prioritize user-selected text when provided.
-If a question is clearly about physics, programming, or mathematics, suggest using the appropriate specialist.
-        """,
+        instructions="""You are a general AI tutor. Prioritize user-selected text when provided.""",
         model=model,
         tools=[retrieve, use_selected_text]
     )
@@ -461,110 +677,58 @@ If a question is clearly about physics, programming, or mathematics, suggest usi
         "general": general_agent
     }
 
-# Initialize specialist agents
 specialist_agents = create_specialist_agents()
 
-# Keep the original agent for backward compatibility
 agent = Agent(
     name="AI Tutor",
-    instructions="""
-You are an expert AI tutor specializing in Physical AI and Humanoid Robotics.
-
-Your guidelines:
-1. If the user has provided selected text (indicated by the use_selected_text tool being called),
-   PRIORITIZE that text in your response. It's the most relevant context for their question.
-2. For regular queries without selected text, use the retrieve tool to get relevant information.
-3. Answer based primarily on the provided context (selected text first, then retrieved documents).
-4. When using selected text, explicitly acknowledge it in your response (e.g., "Based on the text you selected...").
-5. Provide clear, educational explanations.
-6. Be concise but thorough in your answers.
-7. Cite the relevant information from your sources.
-
-Important: Never make up information. If you're not sure based on the provided content, admit it.
-""",
+    instructions="""You are an expert AI tutor. Use selected text when provided, otherwise retrieve relevant information.""",
     model=model,
     tools=[retrieve, use_selected_text]
 )
 
 # ---------------------------------------------------
-# Retry Logic for API Calls
+# Helper Functions
 # ---------------------------------------------------
 def route_to_specialist(query: str, selected_text: Optional[str] = None) -> Literal["physics", "programming", "mathematics", "general"]:
-    """Route query to the appropriate specialist based on keywords"""
-
-    query_lower = query.lower()
-
-    # Check for selected text - if present, use general agent with prioritized text
+    """Route query to appropriate specialist"""
     if selected_text:
         return "general"
-
-    # Programming keywords
-    programming_keywords = [
-        'code', 'program', 'algorithm', 'function', 'class', 'implement',
-        'python', 'c++', 'java', 'ros', 'api', 'software', 'debug',
-        'syntax', 'variable', 'loop', 'conditional', 'array', 'list'
-    ]
-
-    # Mathematics keywords
-    mathematics_keywords = [
-        'equation', 'formula', 'calculate', 'derivative', 'integral',
-        'matrix', 'vector', 'trigonometry', 'geometry', 'algebra',
-        'statistics', 'probability', 'optimization', 'linear algebra',
-        'calculus', 'proof', 'theorem', 'mathematics'
-    ]
-
-    # Physics keywords
-    physics_keywords = [
-        'force', 'torque', 'momentum', 'energy', 'velocity', 'acceleration',
-        'mass', 'gravity', 'friction', 'pressure', 'stress', 'strain',
-        'mechanics', 'dynamics', 'kinematics', 'physics', 'motion',
-        'balance', 'stability', 'vibration', 'wave', 'heat'
-    ]
-
-    # Count keyword matches
-    programming_score = sum(1 for keyword in programming_keywords if keyword in query_lower)
-    mathematics_score = sum(1 for keyword in mathematics_keywords if keyword in query_lower)
-    physics_score = sum(1 for keyword in physics_keywords if keyword in query_lower)
-
-    # Determine the best specialist
-    scores = {
-        "programming": programming_score,
-        "mathematics": mathematics_score,
-        "physics": physics_score
-    }
-
-    # Return the specialist with the highest score, or general if tie/zero
+    
+    query_lower = query.lower()
+    
+    programming_kw = ['code', 'program', 'algorithm', 'function', 'implement']
+    mathematics_kw = ['equation', 'formula', 'calculate', 'matrix', 'vector']
+    physics_kw = ['force', 'torque', 'momentum', 'energy', 'dynamics']
+    
+    p_score = sum(1 for kw in programming_kw if kw in query_lower)
+    m_score = sum(1 for kw in mathematics_kw if kw in query_lower)
+    ph_score = sum(1 for kw in physics_kw if kw in query_lower)
+    
+    scores = {"programming": p_score, "mathematics": m_score, "physics": ph_score}
     max_score = max(scores.values())
+    
     if max_score == 0:
         return "general"
-
-    # Handle ties by returning the first with max score
+    
     for specialist, score in scores.items():
         if score == max_score:
             return specialist
-
+    
     return "general"
 
-# ---------------------------------------------------
-# Retry Logic for API Calls
-# ---------------------------------------------------
-async def run_with_retry(agent: Agent, user_input: str, selected_text: Optional[str] = None, max_retries: int = 3) -> Any:
-    """
-    Execute the agent with retry logic for handling rate limits
-    """
+async def run_with_retry(agent: Agent, user_input: str, selected_text: Optional[str] = None, max_retries: int = 3):
+    """Execute agent with retry logic"""
     base_delay = 1.0
     max_delay = 10.0
 
-    # Modify the input if we have selected text
     if selected_text:
-        # Add context about selected text to guide the agent
         modified_input = f"""
 User Question: {user_input}
 
-User has selected the following text which is highly relevant to their question:
+User has selected the following text:
 "{selected_text}"
 
-Please address their question using this selected text as the primary source of information.
+Please address their question using this selected text as the primary source.
 """
     else:
         modified_input = user_input
@@ -575,119 +739,176 @@ Please address their question using this selected text as the primary source of 
             return result
 
         except APIError as e:
-            # Check if it's a rate limit error
             if "rate_limit" in str(e).lower() or "429" in str(e):
                 if attempt < max_retries - 1:
-                    # Exponential backoff with jitter
                     delay = min(base_delay * (2 ** attempt), max_delay)
-                    jitter = random.uniform(0.5, 1.5)
-                    wait_time = delay * jitter
-
-                    logger.warning(
-                        f"Rate limit hit (attempt {attempt + 1}/{max_retries}). "
-                        f"Waiting {wait_time:.2f}s before retry..."
-                    )
-                    await asyncio.sleep(wait_time)
+                    await asyncio.sleep(delay)
                     continue
                 else:
-                    raise HTTPException(
-                        status_code=429,
-                        detail="Service temporarily unavailable due to rate limits. Please try again later."
-                    )
+                    raise HTTPException(status_code=429, detail="Rate limit exceeded")
             else:
-                # Different API error
                 logger.error(f"OpenAI API error: {e}")
                 raise HTTPException(status_code=500, detail="AI service error")
 
         except Exception as e:
-            logger.error(f"Unexpected error in agent execution: {e}")
+            logger.error(f"Unexpected error: {e}")
             if attempt < max_retries - 1:
                 await asyncio.sleep(base_delay)
                 continue
             raise HTTPException(status_code=500, detail="Internal server error")
 
-    raise HTTPException(status_code=500, detail="Failed after multiple retries")
+    raise HTTPException(status_code=500, detail="Failed after retries")
+
+def format_conversation_context(history: List[Dict]) -> str:
+    """Format conversation history as context"""
+    if not history:
+        return ""
+    
+    context = "Previous conversation:\n\n"
+    for msg in history:
+        context += f"User: {msg['user_message']}\n"
+        context += f"Assistant: {msg['assistant_response']}\n\n"
+    
+    return context
 
 # ---------------------------------------------------
-# API Endpoints
+# Authentication Endpoints
 # ---------------------------------------------------
-@app.get("/", response_model=HealthResponse)
-async def root():
-    """Root endpoint with basic info"""
-    return HealthResponse(
-        status="healthy",
-        message="AI Tutor API is running with User Text Selection support",
-        details={
-            "model": model.model,
-            "embedding_model": embed_model,
-            "collection": collection_name,
-            "features": ["RAG", "User Text Selection", "Chat"]
-        }
-    )
-
-@app.get("/health", response_model=HealthResponse)
-async def health_check():
-    """Comprehensive health check"""
-    health_status = {
-        "openai": False,
-        "qdrant": False,
-        "embedding_model": embed_model,
-        "chat_model": model.model,
-        "features": {
-            "rag": True,
-            "text_selection": True,
-            "chat": True
-        }
-    }
-
+@app.post("/api/auth/signup", response_model=AuthResponse)
+async def signup(request: SignUpRequest):
+    """Create new user account"""
     try:
-        # Test OpenAI embedding
-        test_embedding = await get_embedding("test")
-        if test_embedding:
-            health_status["openai"] = True
-    except Exception as e:
-        logger.error(f"OpenAI health check failed: {e}")
-
-    try:
-        # Test Qdrant connection
-        collections = qdrant.get_collections()
-        collection_exists = any(
-            c.name == collection_name
-            for c in collections.collections
+        existing_user = await db.get_user_by_email(request.email)
+        if existing_user:
+            raise HTTPException(status_code=400, detail="Email already registered")
+        
+        user = await db.create_user(
+            email=request.email,
+            password=request.password,
+            name=request.name,
+            software_background=request.software_background,
+            hardware_background=request.hardware_background
         )
-        if collection_exists:
-            collection_info = qdrant.get_collection(collection_name)
-            health_status["qdrant"] = True
-            health_status["collection_points"] = collection_info.points_count
-            health_status["vector_size"] = collection_info.config.params.vectors.size
+        
+        if not user:
+            raise HTTPException(status_code=500, detail="Failed to create user")
+        
+        token = create_access_token({"user_id": user["id"]})
+        await db.log_event("user_signup", user_id=user["id"])
+        
+        # Pydantic will now automatically handle string parsing via the field_validator
+        return AuthResponse(
+            token=token,
+            user=UserProfile(
+                id=user["id"],
+                email=user["email"],
+                name=user["name"],
+                software_background=user.get("software_background"),
+                hardware_background=user.get("hardware_background"),
+                created_at=user["created_at"]
+            )
+        )
+    
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Qdrant health check failed: {e}")
+        logger.error(f"Signup error: {e}")
+        raise HTTPException(status_code=500, detail="Signup failed")
 
-    all_healthy = all([health_status["openai"], health_status["qdrant"]])
+@app.post("/api/auth/signin", response_model=AuthResponse)
+async def signin(request: SignInRequest):
+    """Sign in user"""
+    try:
+        user = await db.get_user_by_email(request.email)
+        if not user:
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+        
+        if not verify_password(request.password, user["password_hash"]):
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+        
+        token = create_access_token({"user_id": user["id"]})
+        await db.log_event("user_signin", user_id=user["id"])
+        
+        return AuthResponse(
+            token=token,
+            user=UserProfile(
+                id=user["id"],
+                email=user["email"],
+                name=user["name"],
+                software_background=user.get("software_background"),
+                hardware_background=user.get("hardware_background"),
+                created_at=user["created_at"]
+            )
+        )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Signin error: {e}")
+        raise HTTPException(status_code=500, detail="Signin failed")
 
-    return HealthResponse(
-        status="healthy" if all_healthy else "degraded",
-        message="All services operational" if all_healthy else "Some services unavailable",
-        details=health_status
+@app.post("/api/auth/signout")
+async def signout(user: Dict = Depends(require_auth)):
+    """Sign out user"""
+    await db.log_event("user_signout", user_id=user["id"])
+    return {"message": "Signed out successfully"}
+
+@app.get("/api/auth/me", response_model=UserProfile)
+async def get_me(user: Dict = Depends(require_auth)):
+    """Get current user profile"""
+    # The 'user' dict here comes from get_user_by_id
+    # Pydantic will validate this dict against UserProfile schema
+    return UserProfile(
+        id=user["id"],
+        email=user["email"],
+        name=user["name"],
+        software_background=user.get("software_background"),
+        hardware_background=user.get("hardware_background"),
+        created_at=user["created_at"]
     )
 
+# ---------------------------------------------------
+# Chat Endpoints (with Auth Support)
+# ---------------------------------------------------
 @app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
-    """
-    Main chat endpoint for interacting with the AI tutor
-    Now supports user-selected text for prioritized responses
-    """
+async def chat(request: ChatRequest, current_user: Optional[Dict] = Depends(get_current_user)):
+    """Main chat endpoint with optional authentication"""
     start_time = time.time()
 
     try:
-        logger.info(f"Received message: {request.message[:100]}...")
-        if request.selected_text:
-            logger.info(f"User provided selected text: {request.selected_text[:100]}...")
+        conversation_id = request.conversation_id or f"conv_{datetime.now().timestamp()}"
+        session_id = request.session_id or f"session_{conversation_id}"
+        user_id = current_user["id"] if current_user else None
+        
+        # Get conversation history
+        history = await db.get_conversation_history(conversation_id, limit=5)
+        context = format_conversation_context(history)
+        
+        # Add user background
+        if current_user:
+            bg_info = []
+            if current_user.get("software_background"):
+                # Handle both dict and potentially parsed string cases safely
+                sw = current_user['software_background']
+                if isinstance(sw, str):
+                    try: sw = json.loads(sw)
+                    except: sw = {}
+                bg_info.append(f"Software: {sw}")
 
-        # Run the agent with retry logic and selected text
-        result = await run_with_retry(agent, request.message, request.selected_text)
+            if current_user.get("hardware_background"):
+                hw = current_user['hardware_background']
+                if isinstance(hw, str):
+                    try: hw = json.loads(hw)
+                    except: hw = {}
+                bg_info.append(f"Hardware: {hw}")
+                
+            if bg_info:
+                context += "User background: " + ", ".join(bg_info) + "\n\n"
+        
+        full_input = context + f"Current question: {request.message}"
+        result = await run_with_retry(agent, full_input, request.selected_text)
 
-        # Extract sources from the agent's tool calls
+        # Extract sources
         sources = []
         retrieval_count = 0
         used_selected_text = False
@@ -697,59 +918,272 @@ async def chat(request: ChatRequest):
                 if hasattr(response, 'tool_calls'):
                     for tool_call in response.tool_calls:
                         if tool_call.function.name == "retrieve":
-                            # Regular retrieval
                             retrieved_texts = tool_call.function.result
                             if isinstance(retrieved_texts, list):
                                 retrieval_count = len(retrieved_texts)
-                                sources = [
-                                    Source(
-                                        text=text[:500] + "..." if len(text) > 500 else text,
-                                        is_user_selected=False
-                                    )
-                                    for text in retrieved_texts
-                                ]
+                                sources = [Source(text=t[:500]+"..." if len(t)>500 else t, is_user_selected=False) for t in retrieved_texts]
                         elif tool_call.function.name == "use_selected_text":
-                            # User-selected text was used
                             used_selected_text = True
                             retrieved_texts = tool_call.function.result
                             if isinstance(retrieved_texts, list):
                                 retrieval_count = len(retrieved_texts)
                                 for i, text in enumerate(retrieved_texts):
-                                    is_user_selected = (i == 0)  # First result is the user selection
-                                    sources.append(
-                                        Source(
-                                            text=text[:500] + "..." if len(text) > 500 else text,
-                                            is_user_selected=is_user_selected,
-                                            url="User Selection" if is_user_selected else None
-                                        )
-                                    )
+                                    is_user_selected = (i == 0)
+                                    sources.append(Source(
+                                        text=text[:500]+"..." if len(text)>500 else text,
+                                        is_user_selected=is_user_selected,
+                                        url="User Selection" if is_user_selected else None
+                                    ))
 
-        # Calculate response time
-        response_time = time.time() - start_time
-        logger.info(f"Response generated in {response_time:.2f}s with {retrieval_count} sources")
+        # Save conversation
+        await db.save_conversation(
+            conversation_id=conversation_id,
+            session_id=session_id,
+            user_id=user_id,
+            user_message=request.message,
+            assistant_response=result.final_output,
+            metadata={"selected_text": request.selected_text, "response_time": time.time()-start_time, "retrieval_count": retrieval_count}
+        )
+
+        logger.info(f"Response in {time.time()-start_time:.2f}s with {retrieval_count} sources")
 
         return ChatResponse(
             response=result.final_output,
             sources=sources,
-            conversation_id=request.conversation_id,
-            session_id=request.session_id,
+            conversation_id=conversation_id,
+            session_id=session_id,
             model_used=model.model,
             retrieval_count=retrieval_count,
             used_selected_text=used_selected_text
         )
 
-    except HTTPException as he:
-        raise he
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Chat endpoint error: {e}")
-        raise HTTPException(status_code=500, detail="Failed to process chat request")
+        logger.error(f"Chat error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to process chat")
+
+@app.post("/chat/specialist", response_model=SpecialistResponse)
+async def chat_with_specialist(request: SpecialistRequest, current_user: Optional[Dict] = Depends(get_current_user)):
+    """Chat with specialist agent"""
+    start_time = time.time()
+
+    try:
+        conversation_id = request.conversation_id or f"conv_{datetime.now().timestamp()}"
+        session_id = request.session_id or f"session_{conversation_id}"
+        user_id = current_user["id"] if current_user else None
+
+        # Determine specialist
+        if request.specialist_type == "general":
+            specialist_type = route_to_specialist(request.message, request.selected_text)
+        else:
+            specialist_type = request.specialist_type
+
+        # Get history and context
+        history = await db.get_conversation_history(conversation_id, limit=5)
+        context = format_conversation_context(history)
+        
+        # Add user background
+        if current_user:
+            bg_info = []
+            if current_user.get("software_background"):
+                bg_info.append(f"Software: {current_user['software_background']}")
+            if current_user.get("hardware_background"):
+                bg_info.append(f"Hardware: {current_user['hardware_background']}")
+            if bg_info:
+                context += "User background: " + ", ".join(bg_info) + "\n\n"
+
+        full_input = context + f"Current question: {request.message}"
+
+        # Run agent
+        agent_to_use = specialist_agents[specialist_type]
+        result = await run_with_retry(agent_to_use, full_input, request.selected_text)
+
+        # Save conversation
+        await db.save_conversation(
+            conversation_id=conversation_id,
+            session_id=session_id,
+            user_id=user_id,
+            user_message=request.message,
+            assistant_response=result.final_output,
+            specialist_type=specialist_type,
+            confidence=0.85,
+            metadata={"selected_text": request.selected_text, "response_time": time.time()-start_time}
+        )
+
+        return SpecialistResponse(
+            response=result.final_output,
+            specialist_type=specialist_type,
+            conversation_id=conversation_id,
+            session_id=session_id,
+            model_used=model.model,
+            confidence=0.85
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Specialist chat error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to process specialist chat")
+
+@app.post("/chat/continue")
+async def continue_chat(request: Dict[str, Any], current_user: Optional[Dict] = Depends(get_current_user)):
+    """Continue an existing conversation"""
+    try:
+        message = request.get("message")
+        if not message:
+            raise HTTPException(status_code=400, detail="Message is required")
+
+        conversation_id = request.get("conversation_id") or f"conv_{datetime.now().timestamp()}"
+        specialist_type = request.get("specialist_type", "general")
+        selected_text = request.get("selected_text")
+        user_id = current_user["id"] if current_user else None
+
+        # Auto-route if general
+        if specialist_type == "general":
+            specialist_type = route_to_specialist(message, selected_text)
+
+        # Get conversation history
+        history = await db.get_conversation_history(conversation_id, limit=5)
+        context = format_conversation_context(history)
+        
+        # Add user background
+        if current_user:
+            bg_info = []
+            if current_user.get("software_background"):
+                bg_info.append(f"Software: {current_user['software_background']}")
+            if current_user.get("hardware_background"):
+                bg_info.append(f"Hardware: {current_user['hardware_background']}")
+            if bg_info:
+                context += "User background: " + ", ".join(bg_info) + "\n\n"
+
+        full_input = context + f"Current question: {message}"
+
+        # Get agent and run
+        agent_to_use = specialist_agents[specialist_type]
+        result = await run_with_retry(agent_to_use, full_input, selected_text)
+        session_id = f"session_{conversation_id}"
+
+        # Save conversation
+        await db.save_conversation(
+            conversation_id=conversation_id,
+            session_id=session_id,
+            user_id=user_id,
+            user_message=message,
+            assistant_response=result.final_output,
+            specialist_type=specialist_type,
+            confidence=0.85,
+            metadata={"is_continuation": len(history)>0, "history_count": len(history), "selected_text": selected_text}
+        )
+
+        return {
+            "response": result.final_output,
+            "specialist_type": specialist_type,
+            "conversation_id": conversation_id,
+            "session_id": session_id,
+            "model_used": model.model,
+            "confidence": 0.85,
+            "is_continuation": len(history) > 0,
+            "history_count": len(history)
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Continue chat error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to continue chat")
 
 # ---------------------------------------------------
-# Additional Utility Endpoints
+# Utility Endpoints
 # ---------------------------------------------------
+@app.get("/", response_model=HealthResponse)
+async def root():
+    """Root endpoint"""
+    return HealthResponse(
+        status="healthy",
+        message="AI Tutor API with Authentication is running",
+        details={
+            "model": model.model,
+            "embedding_model": embed_model,
+            "collection": collection_name,
+            "features": ["RAG", "Authentication", "User Text Selection", "Chat Memory", "UUID Support"]
+        }
+    )
+
+@app.get("/health", response_model=HealthResponse)
+async def health_check():
+    """Health check"""
+    health_status = {
+        "openai": False,
+        "qdrant": False,
+        "database": False,
+        "embedding_model": embed_model,
+        "chat_model": model.model
+    }
+
+    try:
+        test_embedding = await get_embedding("test")
+        if test_embedding:
+            health_status["openai"] = True
+    except Exception as e:
+        logger.error(f"OpenAI health check failed: {e}")
+
+    try:
+        collections = qdrant.get_collections()
+        if any(c.name == collection_name for c in collections.collections):
+            health_status["qdrant"] = True
+    except Exception as e:
+        logger.error(f"Qdrant health check failed: {e}")
+
+    try:
+        if db.pool:
+            health_status["database"] = True
+    except Exception as e:
+        logger.error(f"Database health check failed: {e}")
+
+    all_healthy = all([health_status["openai"], health_status["qdrant"], health_status["database"]])
+
+    return HealthResponse(
+        status="healthy" if all_healthy else "degraded",
+        message="All services operational" if all_healthy else "Some services unavailable",
+        details=health_status
+    )
+
+@app.get("/conversation/{conversation_id}")
+async def get_conversation_history_endpoint(conversation_id: str, limit: int = 10, current_user: Optional[Dict] = Depends(get_current_user)):
+    """Get conversation history"""
+    try:
+        history = await db.get_conversation_history(conversation_id, limit)
+        return {"conversation_id": conversation_id, "history": history}
+    except Exception as e:
+        logger.error(f"Error retrieving conversation: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve conversation")
+
+@app.get("/my-conversations")
+async def get_my_conversations(limit: int = 20, current_user: Dict = Depends(require_auth)):
+    """Get all conversations for authenticated user"""
+    try:
+        conversations = await db.get_user_conversations(current_user["id"], limit)
+        return {"conversations": conversations}
+    except Exception as e:
+        logger.error(f"Error retrieving user conversations: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve conversations")
+
+@app.get("/specialists")
+async def get_specialists():
+    """Get list of available specialists"""
+    return {
+        "specialists": [
+            {"type": "physics", "name": "Physics Tutor", "description": "Expert in mechanics, forces, energy, control theory"},
+            {"type": "programming", "name": "Programming Tutor", "description": "Expert in robotics programming and algorithms"},
+            {"type": "mathematics", "name": "Mathematics Tutor", "description": "Expert in linear algebra, calculus, optimization"},
+            {"type": "general", "name": "General AI Tutor", "description": "General assistant for all topics"}
+        ]
+    }
+
 @app.get("/collection/stats")
 async def get_collection_stats():
-    """Get statistics about the Qdrant collection"""
+    """Get Qdrant collection statistics"""
     try:
         collection_info = qdrant.get_collection(collection_name)
         return {
@@ -760,93 +1194,13 @@ async def get_collection_stats():
         }
     except Exception as e:
         logger.error(f"Error getting collection stats: {e}")
-        raise HTTPException(status_code=404, detail="Collection not found or error")
-
-@app.post("/chat/specialist", response_model=SpecialistResponse)
-async def chat_with_specialist(request: SpecialistRequest):
-    """
-    Chat endpoint with automatic specialist routing or manual selection
-    """
-    start_time = time.time()
-
-    try:
-        logger.info(f"Received specialist request: {request.message[:100]}...")
-
-        # Determine which specialist to use
-        if request.specialist_type == "general":
-            # Auto-route based on content
-            specialist_type = route_to_specialist(request.message, request.selected_text)
-        else:
-            specialist_type = request.specialist_type
-
-        logger.info(f"Selected specialist: {specialist_type}")
-
-        # Get the appropriate agent
-        agent = specialist_agents[specialist_type]
-
-        # Run the agent with retry logic
-        result = await run_with_retry(agent, request.message, request.selected_text)
-
-        # Calculate response time
-        response_time = time.time() - start_time
-        logger.info(f"Specialist response generated in {response_time:.2f}s")
-
-        return SpecialistResponse(
-            response=result.final_output,
-            specialist_type=specialist_type,
-            conversation_id=request.conversation_id,
-            session_id=request.session_id,
-            model_used=model.model,
-            confidence=0.85  # Placeholder confidence score
-        )
-
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        logger.error(f"Specialist chat endpoint error: {e}")
-        raise HTTPException(status_code=500, detail="Failed to process specialist chat request")
-
-@app.get("/specialists")
-async def get_specialists():
-    """Get list of available specialist agents"""
-    specialists_info = {
-        "specialists": [
-            {
-                "type": "physics",
-                "name": "Physics Tutor",
-                "description": "Expert in mechanics, forces, energy, and control theory",
-                "keywords": ["force", "torque", "momentum", "energy", "mechanics"]
-            },
-            {
-                "type": "programming",
-                "name": "Programming Tutor",
-                "description": "Expert in robotics programming, algorithms, and software architecture",
-                "keywords": ["code", "algorithm", "python", "implement", "software"]
-            },
-            {
-                "type": "mathematics",
-                "name": "Mathematics Tutor",
-                "description": "Expert in linear algebra, calculus, and optimization for robotics",
-                "keywords": ["equation", "matrix", "calculate", "geometry", "algebra"]
-            },
-            {
-                "type": "general",
-                "name": "General AI Tutor",
-                "description": "General assistant that can help with any topic and prioritizes selected text",
-                "keywords": ["general", "help", "explain", "overview"]
-            }
-        ],
-        "auto_routing": True,
-        "supported_languages": ["python", "c++", "javascript"]
-    }
-    return specialists_info
+        raise HTTPException(status_code=404, detail="Collection not found")
 
 @app.delete("/collection")
-async def clear_collection():
-    """Clear all points from the collection (use with caution!)"""
+async def clear_collection(current_user: Dict = Depends(require_auth)):
+    """Clear collection (authenticated only)"""
     try:
         qdrant.delete_collection(collection_name)
-        # Recreate collection
         vector_size = 1536 if embed_model == "text-embedding-3-small" else 3072
         qdrant.create_collection(
             collection_name=collection_name,
@@ -857,38 +1211,8 @@ async def clear_collection():
         logger.error(f"Error clearing collection: {e}")
         raise HTTPException(status_code=500, detail="Failed to clear collection")
 
-# ---------------------------------------------------
-# Run Server (Development)
-# ---------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-    import argparse
-
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description="AI Tutor API Server with User Text Selection")
-    parser.add_argument("--port", type=int, default=int(os.getenv("PORT", 8000)),
-                        help="Port to run the server on")
-    args = parser.parse_args()
-
-    # Configure logging for uvicorn
-    if args.port == int(os.getenv("PORT", 8000)):
-        # Default port, use reload
-        uvicorn_config = {
-            "app": "main:app",
-            "host": "0.0.0.0",
-            "port": args.port,
-            "reload": True,
-            "log_level": "info"
-        }
-    else:
-        # Custom port, don't use reload
-        uvicorn_config = {
-            "app": app,
-            "host": "0.0.0.0",
-            "port": args.port,
-            "reload": False,
-            "log_level": "info"
-        }
-
-    logger.info(f"Starting AI Tutor API server on port {args.port} with User Text Selection support...")
-    uvicorn.run(**uvicorn_config)
+    port = int(os.getenv("PORT", 8000))
+    logger.info(f"Starting AI Tutor API server with authentication on port {port}...")
+    uvicorn.run(app, host="0.0.0.0", port=port)
